@@ -9,6 +9,7 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 from google import genai
 from google.genai import types as genai_types
 
@@ -23,7 +24,6 @@ if not TELEGRAM_BOT_TOKEN:
 if not GEMINI_API_KEY:
     sys.exit("ОШИБКА: GEMINI_API_KEY не задан!")
 
-# Флагманская модель третьего поколения
 GEMINI_MODEL = "gemini-3.5-pro"
 DB_PATH = "chat_history.db"
 
@@ -39,6 +39,18 @@ SYSTEM_INSTRUCTION = """
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+
+def get_main_keyboard() -> ReplyKeyboardMarkup:
+    """Нижняя панель с постоянной кнопкой сброса контекста."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🧹 Очистить контекст")]
+        ],
+        resize_keyboard=True,
+        persistent=True,
+    )
+
 
 # ================= РАБОТА С БАЗОЙ ДАННЫХ (SQLite) =================
 
@@ -78,7 +90,7 @@ def load_user_history(user_id: int, limit: int = 14):
     )
     rows = cursor.fetchall()
     conn.close()
-    
+
     rows.reverse()
     formatted_history = []
     for role, content in rows:
@@ -102,7 +114,7 @@ def clear_user_history(user_id: int):
 # ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
 
 def split_text(text: str, max_length: int = 4000) -> list[str]:
-    """Разбивает длинный ответ на части по абзацам для лимита Telegram."""
+    """Разбивает длинный ответ на части по границам абзацев под лимит Telegram."""
     if len(text) <= max_length:
         return [text]
 
@@ -140,25 +152,33 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "✨ **Gemini 3.5 Pro готов к работе.**\n\n"
         "Вы можете:\n"
-        "• Задавать сложные технические вопросы и вести диалог в контексте\n"
-        "• Отправлять фотографии, схемы и скриншоты ошибок для анализа\n"
-        "• Скидывать файлы кода (`.py`, `.cpp`, `.log`, `.json`, `.txt`) на ревью\n\n"
-        "Команды:\n"
-        "• `/clear` — сбросить контекст диалога\n"
-        "• `/model` — статус текущей модели",
-        parse_mode="Markdown"
+        "• Задавать технические вопросы и вести диалог с сохранением контекста\n"
+        "• Присылать фотографии, схемы и логи ошибок\n"
+        "• Отправлять файлы кода (`.py`, `.cpp`, `.log`, `.json`, `.txt`)\n\n"
+        "Для сброса памяти диалога нажмите кнопку **«🧹 Очистить контекст»** внизу.",
+        reply_markup=get_main_keyboard(),
+        parse_mode="Markdown",
     )
 
 
+# Сброс контекста срабатывает как по команде /clear, так и по нажатию кнопки
+@dp.message(F.text == "🧹 Очистить контекст")
 @dp.message(Command("clear"))
-async def cmd_clear(message: types.Message):
+async def clear_dialog_handler(message: types.Message):
     clear_user_history(message.from_user.id)
-    await message.answer("🧹 Контекст диалога очищен. Начинаем новую тему!")
+    await message.answer(
+        "🧹 Контекст диалога успешно очищен. Начинаем новую тему!",
+        reply_markup=get_main_keyboard(),
+    )
 
 
 @dp.message(Command("model"))
 async def cmd_model(message: types.Message):
-    await message.answer(f"🧠 Текущая языковая модель: **{GEMINI_MODEL}**", parse_mode="Markdown")
+    await message.answer(
+        f"🧠 Текущая модель: **{GEMINI_MODEL}**",
+        reply_markup=get_main_keyboard(),
+        parse_mode="Markdown",
+    )
 
 
 @dp.message(F.photo)
@@ -166,7 +186,6 @@ async def handle_photo(message: types.Message):
     user_id = message.from_user.id
     await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
 
-    # Скачивание фотографии
     photo_file = await bot.get_file(message.photo[-1].file_id)
     photo_stream = io.BytesIO()
     await bot.download_file(photo_file.file_path, destination=photo_stream)
@@ -180,14 +199,14 @@ async def handle_photo(message: types.Message):
         history=history,
         config=genai_types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.4
-        )
+            temperature=0.4,
+        ),
     )
 
     try:
         content_payload = [
             genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-            user_caption
+            user_caption,
         ]
         response = chat.send_message(content_payload)
         answer = response.text
@@ -203,12 +222,11 @@ async def handle_photo(message: types.Message):
 
 @dp.message(F.document)
 async def handle_document(message: types.Message):
-    """Анализ текстовых документов и файлов кода"""
     doc = message.document
     valid_extensions = (".txt", ".py", ".cpp", ".h", ".json", ".log", ".csv", ".md", ".sh")
 
     if not any(doc.file_name.lower().endswith(ext) for ext in valid_extensions):
-        await message.answer("Поддерживаются текстовые файлы: .txt, .py, .cpp, .json, .log, .csv, .md")
+        await message.answer("Поддерживаются текстовые форматы: .txt, .py, .cpp, .json, .log, .csv, .md")
         return
 
     await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
@@ -229,8 +247,8 @@ async def handle_document(message: types.Message):
         history=history,
         config=genai_types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.3
-        )
+            temperature=0.3,
+        ),
     )
 
     try:
@@ -260,8 +278,8 @@ async def handle_text(message: types.Message):
         history=history,
         config=genai_types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.6
-        )
+            temperature=0.6,
+        ),
     )
 
     try:

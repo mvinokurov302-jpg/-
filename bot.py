@@ -104,7 +104,7 @@ async def call_gemini_with_retry(contents, retries=3, delay=3):
                     system_instruction=SYSTEM_INSTRUCTION,
                     temperature=0.7,
                     # ПОДКЛЮЧАЕМ ПОИСК GOOGLE
-                    tools=[{"google_search": {}}]
+                   
                 )
             )
             return response.text

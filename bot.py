@@ -63,11 +63,10 @@ def is_user_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USERS
 
 async def call_gemini_with_retry(contents, retries=3, delay=3):
-    """Вызов API Gemini с автоматическим повтором при перегрузке (ошибка 429)."""
     for attempt in range(retries):
         try:
             response = ai_client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.5-flash-lite",
                 contents=contents,
                 config=genai_types.GenerateContentConfig(
                     system_instruction=SYSTEM_INSTRUCTION,

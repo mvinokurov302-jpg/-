@@ -24,7 +24,7 @@ if not TELEGRAM_BOT_TOKEN:
 if not GEMINI_API_KEY:
     sys.exit("ОШИБКА: GEMINI_API_KEY не задан!")
 
-GEMINI_MODEL = "gemini-3.5-pro"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 DB_PATH = "chat_history.db"
 
 SYSTEM_INSTRUCTION = """

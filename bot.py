@@ -1,319 +1,251 @@
-import asyncio
-import io
 import os
-import sqlite3
-import sys
-
+import io
+import asyncio
+import logging
+import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.enums import ChatAction
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+from aiogram.filters import CommandStart, Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from google import genai
 from google.genai import types as genai_types
+from google.genai.types import Part
 
-# ================= НАСТРОЙКИ =================
+# ----------------- КОНФИГУРАЦИЯ И ПЕРЕМЕННЫЕ -----------------
+
+# Логирование
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Токены из переменных окружения
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-PORT = int(os.getenv("PORT", 10000))
 
-if not TELEGRAM_BOT_TOKEN:
-    sys.exit("ОШИБКА: TELEGRAM_BOT_TOKEN не задан!")
+# Публичный адрес на Render для самопинга
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://nails-bot-online.onrender.com")
 
-if not GEMINI_API_KEY:
-    sys.exit("ОШИБКА: GEMINI_API_KEY не задан!")
+# БЕЛЫЙ СПИСОК (Whitelist): укажите сюда Telegram ID пользователей (числа)
+# Если список пустой (ALLOWED_USERS = []), бот доступен всем.
+ALLOWED_USERS = []
 
-GEMINI_MODEL = "gemini-3.5-flash-lite"
-DB_PATH = "chat_history.db"
+# Системный промпт для модели
+SYSTEM_INSTRUCTION = (
+    "Ты — универсальный, умный и дружелюбный персональный ассистент. "
+    "Отвечай структурированно, точно, без лишней воды. "
+    "При необходимости форматируй ответ в Markdown."
+)
 
-SYSTEM_INSTRUCTION = """
-Ты — Gemini, передовой интеллектуальный ассистент от Google.
-Твой стиль общения:
-- Умный, эрудированный, точный, объективный и вежливый.
-- Форматируй ответы в чистый Markdown: выделяй главное жирным, структурируй списки, делай логичные отступы.
-- Оформляй фрагменты кода с указанием языка (```python, ```cpp, ```bash).
-- Отвечай подробно, полно и с высокой глубиной погружения в вопрос, избегая пустых заполнителей текста.
-"""
-
+# Инициализация клиентов
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
+# Локальная история диалогов в оперативной памяти: {user_id: [список сообщений]}
+# Ограничиваем последними 10 репликами, чтобы не раздувать токены
+chat_histories = {}
+MAX_HISTORY_MESSAGES = 10
 
-def get_main_keyboard() -> ReplyKeyboardMarkup:
-    """Нижняя панель с постоянной кнопкой сброса контекста."""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🧹 Очистить контекст")]
-        ],
-        resize_keyboard=True,
-        persistent=True,
-    )
+# ----------------- КЛАВИАТУРА -----------------
 
+main_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🧹 Очистить контекст")]
+    ],
+    resize_keyboard=True
+)
 
-# ================= РАБОТА С БАЗОЙ ДАННЫХ (SQLite) =================
+# ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            role TEXT,
-            content TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+def is_user_allowed(user_id: int) -> bool:
+    """Проверка наличия пользователя в белом списке."""
+    if not ALLOWED_USERS:
+        return True
+    return user_id in ALLOWED_USERS
 
-
-def save_history_msg(user_id: int, role: str, content: str):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO messages (user_id, role, content) VALUES (?, ?, ?)",
-        (user_id, role, content)
-    )
-    conn.commit()
-    conn.close()
-
-
-def load_user_history(user_id: int, limit: int = 14):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT role, content FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?",
-        (user_id, limit)
-    )
-    rows = cursor.fetchall()
-    conn.close()
-
-    rows.reverse()
-    formatted_history = []
-    for role, content in rows:
-        formatted_history.append(
-            genai_types.Content(
-                role=role,
-                parts=[genai_types.Part.from_text(text=content)]
-            )
-        )
-    return formatted_history
-
-
-def clear_user_history(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-
-# ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
-
-def split_text(text: str, max_length: int = 4000) -> list[str]:
-    """Разбивает длинный ответ на части по границам абзацев под лимит Telegram."""
-    if len(text) <= max_length:
-        return [text]
-
-    chunks = []
-    while len(text) > max_length:
-        split_idx = text.rfind("\n\n", 0, max_length)
-        if split_idx == -1:
-            split_idx = text.rfind("\n", 0, max_length)
-        if split_idx == -1:
-            split_idx = text.rfind(" ", 0, max_length)
-        if split_idx == -1:
-            split_idx = max_length
-
-        chunks.append(text[:split_idx].strip())
-        text = text[split_idx:].strip()
-
-    if text:
-        chunks.append(text)
-    return chunks
-
-
-async def send_response_safely(message: types.Message, full_text: str):
-    chunks = split_text(full_text)
-    for chunk in chunks:
+async def call_gemini_with_retry(contents, retries=3, delay=3):
+    """Вызов API Gemini с автоматическим повтором при перегрузке (ошибка 429)."""
+    for attempt in range(retries):
         try:
-            await message.answer(chunk, parse_mode="Markdown")
-        except Exception:
-            await message.answer(chunk)
+            response = ai_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    temperature=0.7,
+                )
+            )
+            return response.text
+        except Exception as e:
+            err_msg = str(e).lower()
+            if ("429" in err_msg or "resource_exhausted" in err_msg) and attempt < retries - 1:
+                logger.warning(f"Превышен лимит запросов (429). Повтор через {delay} сек... (Попытка {attempt + 1})")
+                await asyncio.sleep(delay)
+                continue
+            raise e
 
-
-# ================= ОБРАБОТЧИКИ СООБЩЕНИЙ =================
+# ----------------- ОБРАБОТЧИКИ СООБЩЕНИЙ -----------------
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer(
-        "✨ **Gemini 3.5 Pro готов к работе.**\n\n"
-        "Вы можете:\n"
-        "• Задавать технические вопросы и вести диалог с сохранением контекста\n"
-        "• Присылать фотографии, схемы и логи ошибок\n"
-        "• Отправлять файлы кода (`.py`, `.cpp`, `.log`, `.json`, `.txt`)\n\n"
-        "Для сброса памяти диалога нажмите кнопку **«🧹 Очистить контекст»** внизу.",
-        reply_markup=get_main_keyboard(),
-        parse_mode="Markdown",
+    if not is_user_allowed(message.from_user.id):
+        await message.answer("Извините, доступ к этому ассистенту ограничен владельцем.")
+        return
+
+    chat_histories[message.from_user.id] = []
+    welcome_text = (
+        "Привет! Я персональный ИИ-ассистент на базе Gemini.\n\n"
+        "Чем я могу помочь:\n"
+        "• Отвечать на любые текстовые вопросы и писать код\n"
+        "• Принимать и слушать голосовые сообщения\n"
+        "• Анализировать прикрепленные фотографии и документы\n\n"
+        "Нажмите кнопку «🧹 Очистить контекст», чтобы начать новую тему."
     )
+    await message.answer(welcome_text, reply_markup=main_keyboard)
 
-
-# Сброс контекста срабатывает как по команде /clear, так и по нажатию кнопки
 @dp.message(F.text == "🧹 Очистить контекст")
 @dp.message(Command("clear"))
-async def clear_dialog_handler(message: types.Message):
-    clear_user_history(message.from_user.id)
-    await message.answer(
-        "🧹 Контекст диалога успешно очищен. Начинаем новую тему!",
-        reply_markup=get_main_keyboard(),
-    )
+async def cmd_clear(message: types.Message):
+    if not is_user_allowed(message.from_user.id):
+        return
+    chat_histories[message.from_user.id] = []
+    await message.answer("Контекст диалога очищен. Готов к новой задаче!", reply_markup=main_keyboard)
 
+@dp.message(F.voice)
+async def handle_voice(message: types.Message):
+    """Обработка голосовых сообщений."""
+    if not is_user_allowed(message.from_user.id):
+        await message.answer("Доступ ограничен.")
+        return
 
-@dp.message(Command("model"))
-async def cmd_model(message: types.Message):
-    await message.answer(
-        f"🧠 Текущая модель: **{GEMINI_MODEL}**",
-        reply_markup=get_main_keyboard(),
-        parse_mode="Markdown",
-    )
+    user_id = message.from_user.id
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
+    try:
+        # 1. Скачиваем голосовое сообщение в память
+        voice_file = await bot.get_file(message.voice.file_id)
+        voice_buffer = io.BytesIO()
+        await bot.download_file(voice_file.file_path, destination=voice_buffer)
+        audio_bytes = voice_buffer.getvalue()
+
+        # 2. Упаковываем аудио для Gemini (Telegram передает войсы в кодеке Opus/OGG)
+        audio_part = Part.from_bytes(data=audio_bytes, mime_type="audio/ogg")
+
+        prompt = [
+            audio_part,
+            "Внимательно послушай это голосовое сообщение и ответь на него текстом по существу вопроса."
+        ]
+
+        # 3. Запрос к нейросети
+        reply_text = await call_gemini_with_retry(prompt)
+        await message.answer(reply_text, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке аудио: {e}")
+        await message.answer("Не удалось обработать голосовое сообщение. Попробуйте еще раз.")
 
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
-    user_id = message.from_user.id
-    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-
-    photo_file = await bot.get_file(message.photo[-1].file_id)
-    photo_stream = io.BytesIO()
-    await bot.download_file(photo_file.file_path, destination=photo_stream)
-    image_bytes = photo_stream.getvalue()
-
-    user_caption = message.caption or "Детально проанализируй это изображение."
-    history = load_user_history(user_id)
-
-    chat = ai_client.chats.create(
-        model=GEMINI_MODEL,
-        history=history,
-        config=genai_types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.4,
-        ),
-    )
-
-    try:
-        content_payload = [
-            genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-            user_caption,
-        ]
-        response = chat.send_message(content_payload)
-        answer = response.text
-
-        save_history_msg(user_id, "user", f"[Фото с описанием: {user_caption}]")
-        save_history_msg(user_id, "model", answer)
-
-        await send_response_safely(message, answer)
-    except Exception as e:
-        print(f"Ошибка Vision: {e}")
-        await message.answer("⚠️ Не удалось проанализировать изображение. Попробуйте еще раз.")
-
-
-@dp.message(F.document)
-async def handle_document(message: types.Message):
-    doc = message.document
-    valid_extensions = (".txt", ".py", ".cpp", ".h", ".json", ".log", ".csv", ".md", ".sh")
-
-    if not any(doc.file_name.lower().endswith(ext) for ext in valid_extensions):
-        await message.answer("Поддерживаются текстовые форматы: .txt, .py, .cpp, .json, .log, .csv, .md")
+    """Обработка изображений."""
+    if not is_user_allowed(message.from_user.id):
+        await message.answer("Доступ ограничен.")
         return
 
-    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-
-    doc_file = await bot.get_file(doc.file_id)
-    stream = io.BytesIO()
-    await bot.download_file(doc_file.file_path, destination=stream)
-    file_content = stream.getvalue().decode("utf-8", errors="ignore")
-
-    user_caption = message.caption or f"Проанализируй прикрепленный файл {doc.file_name}:"
-    prompt = f"{user_caption}\n\n```{doc.file_name}\n{file_content}\n```"
-
-    user_id = message.from_user.id
-    history = load_user_history(user_id)
-
-    chat = ai_client.chats.create(
-        model=GEMINI_MODEL,
-        history=history,
-        config=genai_types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.3,
-        ),
-    )
-
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     try:
-        response = chat.send_message(prompt)
-        answer = response.text
+        photo = message.photo[-1]
+        photo_file = await bot.get_file(photo.file_id)
+        photo_buffer = io.BytesIO()
+        await bot.download_file(photo_file.file_path, destination=photo_buffer)
 
-        save_history_msg(user_id, "user", f"[Файл {doc.file_name}]")
-        save_history_msg(user_id, "model", answer)
+        image_part = Part.from_bytes(data=photo_buffer.getvalue(), mime_type="image/jpeg")
+        user_caption = message.caption or "Что изображено на этом фото? Опиши подробно."
 
-        await send_response_safely(message, answer)
+        prompt = [image_part, user_caption]
+        reply_text = await call_gemini_with_retry(prompt)
+        await message.answer(reply_text, parse_mode="Markdown")
     except Exception as e:
-        print(f"Ошибка Document: {e}")
-        await message.answer("⚠️ Ошибка при чтении файла.")
-
+        logger.error(f"Ошибка при обработке фото: {e}")
+        await message.answer("Не удалось проанализировать изображение.")
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
+    """Обработка стандартных текстовых запросов с памятью контекста."""
+    if not is_user_allowed(message.from_user.id):
+        await message.answer("Доступ ограничен.")
+        return
+
     user_id = message.from_user.id
-    user_prompt = message.text
+    user_text = message.text
 
-    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
-    history = load_user_history(user_id)
+    if user_id not in chat_histories:
+        chat_histories[user_id] = []
 
-    chat = ai_client.chats.create(
-        model=GEMINI_MODEL,
-        history=history,
-        config=genai_types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.6,
-        ),
-    )
+    # Добавляем реплику пользователя
+    chat_histories[user_id].append({"role": "user", "parts": [{"text": user_text}]})
+
+    # Обрезаем историю при превышении лимита
+    if len(chat_histories[user_id]) > MAX_HISTORY_MESSAGES:
+        chat_histories[user_id] = chat_histories[user_id][-MAX_HISTORY_MESSAGES:]
 
     try:
-        response = chat.send_message(user_prompt)
-        answer = response.text
+        reply_text = await call_gemini_with_retry(chat_histories[user_id])
+        # Сохраняем ответ модели в историю
+        chat_histories[user_id].append({"role": "model", "parts": [{"text": reply_text}]})
 
-        save_history_msg(user_id, "user", user_prompt)
-        save_history_msg(user_id, "model", answer)
-
-        await send_response_safely(message, answer)
+        await message.answer(reply_text, parse_mode="Markdown")
     except Exception as e:
-        print(f"Ошибка Gemini: {e}")
-        await message.answer("⚠️ Не удалось получить ответ от модели. Повторите запрос позже.")
+        logger.error(f"Ошибка при генерации текста: {e}")
+        await message.answer("Произошла ошибка при обращении к нейросети. Попробуйте еще раз чуть позже.")
 
+# ----------------- ВЕБ-СЕРВЕР И ВНУТРЕННИЙ ПИНГЕР -----------------
 
-# ================= ВЕБ-СЕРВЕР И ЗАПУСК =================
+async def health_check_handler(request):
+    """Эндпоинт для проверок Render и UptimeRobot."""
+    return web.Response(text="Bot is running OK", status=200)
 
-async def web_health_check(request):
-    return web.Response(text="Gemini 3.5 Web Assistant is active!")
+async def self_ping_task():
+    """Фоновый пингер на случай, если UptimeRobot отключится."""
+    await asyncio.sleep(60)  # Ждем минуту после старта
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                if RENDER_EXTERNAL_URL:
+                    async with session.get(RENDER_EXTERNAL_URL) as resp:
+                        logger.info(f"Self-ping выполнен, статус: {resp.status}")
+            except Exception as e:
+                logger.warning(f"Ошибка self-ping: {e}")
+            await asyncio.sleep(600)  # Пинг раз в 10 минут
 
-
-async def main():
-    init_db()
-
+async def start_web_server():
+    """Запуск легковесного aiohttp сервера для прохождения Health Check на Render."""
     app = web.Application()
-    app.router.add_get("/", web_health_check)
+    app.router.add_get("/", health_check_handler)
+    app.router.add_get("/healthz", health_check_handler)
+
+    port = int(os.getenv("PORT", 10000))
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Health-check сервер запущен на порту {PORT}")
+    logger.info(f"Веб-сервер запущен на порту {port}")
 
+# ----------------- ГЛАВНАЯ ТОЧКА ВХОДА -----------------
+
+async def main():
+    # Запускаем локальный веб-сервер для Render
+    await start_web_server()
+
+    # Запускаем фоновую задачу самопинга
+    asyncio.create_task(self_ping_task())
+
+    # Сбрасываем старые накопившиеся апдейты, чтобы не ловить спам при рестарте
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Бот готов к приему сообщений!")
+
+    # Старт поллинга
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())

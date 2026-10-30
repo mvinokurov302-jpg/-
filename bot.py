@@ -94,7 +94,7 @@ def extract_and_render_formulas(text: str):
     return image_urls
 
 async def call_gemini_with_retry(contents, retries=3, delay=3):
-    """Вызов модели gemini-3.5-flash-lite с автоматическим повтором при перегрузке (429)."""
+    """Вызов модели gemini-3.5-flash-lite с автоматическим веб-поиском."""
     for attempt in range(retries):
         try:
             response = ai_client.models.generate_content(
@@ -103,6 +103,8 @@ async def call_gemini_with_retry(contents, retries=3, delay=3):
                 config=genai_types.GenerateContentConfig(
                     system_instruction=SYSTEM_INSTRUCTION,
                     temperature=0.7,
+                    # ПОДКЛЮЧАЕМ ПОИСК GOOGLE
+                    tools=[{"google_search": {}}]
                 )
             )
             return response.text

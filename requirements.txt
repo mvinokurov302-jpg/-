@@ -1,4 +1,3 @@
-aiogram
-aiohttp
-google-genai
-openpyxl
+aiogram>=3.14.0
+aiohttp>=3.10.0
+google-genai>=1.0.0

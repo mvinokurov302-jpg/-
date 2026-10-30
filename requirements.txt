@@ -1,0 +1,4 @@
+aiogram
+aiohttp
+google-genai
+openpyxl

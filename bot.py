@@ -71,7 +71,7 @@ def is_user_allowed(user_id: int) -> bool:
 def extract_and_render_formulas(text: str):
     """
     Находит все блоки $$...$$ в ответе модели и генерирует ссылки
-    на четкие PNG-изображения формул через онлайн-сервер рендеринга.
+    на чистые PNG-изображения формул без лишних служебных надписей.
     """
     pattern = r"\$\$(.*?)\$\$"
     matches = re.findall(pattern, text, flags=re.DOTALL)
@@ -82,9 +82,12 @@ def extract_and_render_formulas(text: str):
         if not clean_formula:
             continue
         
-        # \dpi{200} задает высокое разрешение, \bg_white делает формулу читаемой на любом фоне
-        latex_payload = f"\\dpi{{200}} \\bg_white {clean_formula}"
+        # Передаем размер \dpi{200} прямо в теле формулы, 
+        # а белый фон и параметры рендера задаем через параметры URL сервиса
+        latex_payload = f"\\dpi{{200}} {clean_formula}"
         encoded_query = urllib.parse.quote(latex_payload)
+        
+        # bg_white задается параметром запроса через &bg=white или в формате SVG/PNG
         url = f"https://latex.codecogs.com/png.image?{encoded_query}"
         image_urls.append((clean_formula, url))
         

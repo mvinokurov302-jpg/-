@@ -191,4 +191,112 @@ async def handle_photo(message: types.Message):
         photo = message.photo[-1]
         photo_file = await bot.get_file(photo.file_id)
         photo_buffer = io.BytesIO()
-        await bot.download_file(photo_file.file_path
+        await bot.download_file(photo_file.file_path, destination=photo_buffer)
+
+        image_part = Part.from_bytes(data=photo_buffer.getvalue(), mime_type="image/jpeg")
+        user_caption = message.caption or "Что изображено на этом фото? Опиши подробно."
+
+        prompt = [image_part, user_caption]
+        reply_text = await call_gemini_with_retry(prompt)
+
+        formulas = extract_and_render_formulas(reply_text)
+        await message.answer(reply_text)
+
+        for raw_formula, img_url in formulas:
+            try:
+                await message.answer_photo(photo=img_url, caption=f"Формула: {raw_formula}")
+            except Exception as img_err:
+                logger.warning(f"Ошибка отправки картинки формулы: {img_err}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке фото: {e}")
+        await message.answer("Не удалось проанализировать изображение.")
+
+@dp.message(F.text)
+async def handle_text(message: types.Message):
+    """Обработка текста с памятью контекста и рендерингом формул."""
+    if not is_user_allowed(message.from_user.id):
+        await message.answer("Доступ ограничен.")
+        return
+
+    user_id = message.from_user.id
+    user_text = message.text
+
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+
+    if user_id not in chat_histories:
+        chat_histories[user_id] = []
+
+    chat_histories[user_id].append({"role": "user", "parts": [{"text": user_text}]})
+
+    # Ограничение длины контекста
+    if len(chat_histories[user_id]) > MAX_HISTORY_MESSAGES:
+        chat_histories[user_id] = chat_histories[user_id][-MAX_HISTORY_MESSAGES:]
+
+    try:
+        reply_text = await call_gemini_with_retry(chat_histories[user_id])
+        chat_histories[user_id].append({"role": "model", "parts": [{"text": reply_text}]})
+
+        # Проверяем, есть ли математические выражения в ответе
+        formulas = extract_and_render_formulas(reply_text)
+
+        # Отправляем основной текст
+        await message.answer(reply_text)
+
+        # Отправляем найденные формулы отдельными графическими карточками
+        for raw_formula, img_url in formulas:
+            try:
+                await message.answer_photo(photo=img_url, caption=f"Формула: {raw_formula}")
+            except Exception as img_err:
+                logger.warning(f"Ошибка отправки картинки формулы: {img_err}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при генерации текста: {e}")
+        await message.answer("Произошла ошибка при обращении к нейросети. Попробуйте еще раз чуть позже.")
+
+# ----------------- ВЕБ-СЕРВЕР И ВНУТРЕННИЙ ПИНГЕР -----------------
+
+async def health_check_handler(request):
+    """Эндпоинт для UptimeRobot и внутреннего пингера."""
+    return web.Response(text="Bot is running OK", status=200)
+
+async def self_ping_task():
+    """Фоновый пинг каждые 10 минут."""
+    await asyncio.sleep(60)
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                if RENDER_EXTERNAL_URL:
+                    async with session.get(RENDER_EXTERNAL_URL) as resp:
+                        logger.info(f"Self-ping выполнен, статус: {resp.status}")
+            except Exception as e:
+                logger.warning(f"Ошибка self-ping: {e}")
+            await asyncio.sleep(600)
+
+async def start_web_server():
+    """Запуск сервера aiohttp на порту Render."""
+    app = web.Application()
+    app.router.add_get("/", health_check_handler)
+    app.router.add_get("/healthz", health_check_handler)
+
+    port = int(os.getenv("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Веб-сервер запущен на порту {port}")
+
+# ----------------- СТАРТ ПРИЛОЖЕНИЯ -----------------
+
+async def main():
+    await start_web_server()
+    asyncio.create_task(self_ping_task())
+
+    # Сбрасываем старые накопившиеся апдейты
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Бот запущен на модели gemini-3.5-flash-lite!")
+
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
